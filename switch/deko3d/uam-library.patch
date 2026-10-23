@@ -1,0 +1,435 @@
+diff --git a/mesa-imported/c11/threads.h b/mesa-imported/c11/threads.h
+index 5a19d76..32a7ec4 100644
+--- a/mesa-imported/c11/threads.h
++++ b/mesa-imported/c11/threads.h
+@@ -1,12 +1,33 @@
+ #pragma once
+ 
+-// This header is fake.
++// The C11 mutex subset Mesa uses, on pthreads: the GLSL type cache and the built-in function
++// library are shared by every compile, so compiles on several threads need real locks here.
+ 
+-typedef int mtx_t;
++#include <pthread.h>
+ 
+-#define mtx_init(_m,...) ((void)(_m))
+-#define mtx_destroy(_m,...) ((void)(_m))
+-#define mtx_lock(_m,...) ((void)(_m))
+-#define mtx_unlock(_m,...) ((void)(_m))
++typedef pthread_mutex_t mtx_t;
+ 
+-#define _MTX_INITIALIZER_NP 0
++enum { mtx_plain = 0 };
++
++#define _MTX_INITIALIZER_NP PTHREAD_MUTEX_INITIALIZER
++
++static inline int mtx_init(mtx_t *mtx, int type)
++{
++	(void)type;
++	return pthread_mutex_init(mtx, NULL);
++}
++
++static inline void mtx_destroy(mtx_t *mtx)
++{
++	pthread_mutex_destroy(mtx);
++}
++
++static inline int mtx_lock(mtx_t *mtx)
++{
++	return pthread_mutex_lock(mtx);
++}
++
++static inline int mtx_unlock(mtx_t *mtx)
++{
++	return pthread_mutex_unlock(mtx);
++}
+diff --git a/mesa-imported/codegen/nv50_ir.cpp b/mesa-imported/codegen/nv50_ir.cpp
+index a7adec0..91c03ca 100644
+--- a/mesa-imported/codegen/nv50_ir.cpp
++++ b/mesa-imported/codegen/nv50_ir.cpp
+@@ -590,6 +590,10 @@ void Instruction::init()
+    predSrc = -1;
+    flagsDef = -1;
+    flagsSrc = -1;
++
++   // Scheduling data must not start as uninitialised heap memory: the compiled code depends on it.
++   // 0x7e0 means no barrier set and nothing to wait on.
++   sched = 0x7e0;
+ }
+ 
+ Instruction::Instruction()
+diff --git a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+index 04717c8..4fc19b7 100644
+--- a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
++++ b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+@@ -4119,7 +4119,9 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+    if (delay <= GM107_MIN_ISSUE_DELAY && (wr & rd) != 7) {
+       // Barriers take one additional clock cycle to become active on top of
+       // the clock consumed by the instruction producing it.
+-      if (!next) {
++      // The next block's waits are only known once that block is visited, so a barrier set by a block's last
++      // instruction needs stall 2 to be active before the next block's first instruction.
++      if (!next || insn->bb != next->bb) {
+          delay = 0x2;
+       } else {
+          int wt = getWtDepBar(next);
+@@ -4128,13 +4130,10 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+       }
+    }
+ 
+-   if (lastDualIssued || !next || delay > 1 || !targ->canDualIssue(insn, next)) {
+-      delay = CLAMP(delay, GM107_MIN_ISSUE_DELAY, GM107_MAX_ISSUE_DELAY);
+-      lastDualIssued = false;
+-   } else {
+-      delay = 0x0; // dual-issue
+-      lastDualIssued = true;
+-   }
++   // Never pair instructions (zero-delay dual issue): paired instructions corrupted whole fragment warps on
++   // hardware, and the reference Mesa scheduler never dual-issues.
++   delay = CLAMP(delay, GM107_MIN_ISSUE_DELAY, GM107_MAX_ISSUE_DELAY);
++   lastDualIssued = false;
+ 
+    emitStall(insn, delay);
+    if (lastDualIssued)
+diff --git a/mesa-imported/compiler/glsl_types.cpp b/mesa-imported/compiler/glsl_types.cpp
+index dcdb06a..5420e82 100644
+--- a/mesa-imported/compiler/glsl_types.cpp
++++ b/mesa-imported/compiler/glsl_types.cpp
+@@ -641,9 +641,11 @@ glsl_type::get_instance(unsigned base_type, unsigned rows, unsigned columns,
+       assert(((glsl_type *) entry->data)->matrix_columns == columns);
+       assert(((glsl_type *) entry->data)->explicit_stride == explicit_stride);
+ 
++      /* Read before unlocking: another thread's insert may rehash the table. */
++      const glsl_type *found = (const glsl_type *) entry->data;
+       mtx_unlock(&glsl_type::hash_mutex);
+ 
+-      return (const glsl_type *) entry->data;
++      return found;
+    }
+ 
+    assert(!row_major);
+@@ -1001,9 +1003,11 @@ glsl_type::get_array_instance(const glsl_type *base,
+    assert(((glsl_type *) entry->data)->length == array_size);
+    assert(((glsl_type *) entry->data)->fields.array == base);
+ 
++   /* Read before unlocking: another thread's insert may rehash the table. */
++   const glsl_type *found = (const glsl_type *) entry->data;
+    mtx_unlock(&glsl_type::hash_mutex);
+ 
+-   return (glsl_type *) entry->data;
++   return found;
+ }
+ 
+ 
+@@ -1152,9 +1156,11 @@ glsl_type::get_record_instance(const glsl_struct_field *fields,
+    assert(((glsl_type *) entry->data)->length == num_fields);
+    assert(strcmp(((glsl_type *) entry->data)->name, name) == 0);
+ 
++   /* Read before unlocking: another thread's insert may rehash the table. */
++   const glsl_type *found = (const glsl_type *) entry->data;
+    mtx_unlock(&glsl_type::hash_mutex);
+ 
+-   return (glsl_type *) entry->data;
++   return found;
+ }
+ 
+ 
+@@ -1187,9 +1193,11 @@ glsl_type::get_interface_instance(const glsl_struct_field *fields,
+    assert(((glsl_type *) entry->data)->length == num_fields);
+    assert(strcmp(((glsl_type *) entry->data)->name, block_name) == 0);
+ 
++   /* Read before unlocking: another thread's insert may rehash the table. */
++   const glsl_type *found = (const glsl_type *) entry->data;
+    mtx_unlock(&glsl_type::hash_mutex);
+ 
+-   return (glsl_type *) entry->data;
++   return found;
+ }
+ 
+ const glsl_type *
+@@ -1215,9 +1223,11 @@ glsl_type::get_subroutine_instance(const char *subroutine_name)
+    assert(((glsl_type *) entry->data)->base_type == GLSL_TYPE_SUBROUTINE);
+    assert(strcmp(((glsl_type *) entry->data)->name, subroutine_name) == 0);
+ 
++   /* Read before unlocking: another thread's insert may rehash the table. */
++   const glsl_type *found = (const glsl_type *) entry->data;
+    mtx_unlock(&glsl_type::hash_mutex);
+ 
+-   return (glsl_type *) entry->data;
++   return found;
+ }
+ 
+ 
+diff --git a/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp b/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp
+index 8ee1094..8e5ebcb 100644
+--- a/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp
++++ b/mesa-imported/state_tracker/st_glsl_to_tgsi.cpp
+@@ -3268,7 +3268,7 @@ glsl_to_tgsi_visitor::visit(ir_constant *ir)
+    gl_constant_value *values = (gl_constant_value *) stack_vals;
+    GLenum gl_type = GL_NONE;
+    unsigned int i, elements;
+-   static int in_array = 0;
++   static thread_local int in_array = 0;
+    gl_register_file file = in_array ? PROGRAM_CONSTANT : PROGRAM_IMMEDIATE;
+ 
+    /* Unfortunately, 4 floats is all we can get into
+diff --git a/source/compiler_iface.cpp b/source/compiler_iface.cpp
+index 7ce5809..dbc11e4 100644
+--- a/source/compiler_iface.cpp
++++ b/source/compiler_iface.cpp
+@@ -201,7 +201,7 @@ nvc0_program_assign_varying_slots(struct nv50_ir_prog_info *info)
+ }
+ 
+ DekoCompiler::DekoCompiler(pipeline_stage stage, int optLevel) :
+-	m_stage{stage}, m_glsl{}, m_tgsi{}, m_tgsiNumTokens{}, m_info{}, m_code{}, m_codeSize{},
++	m_stage{stage}, m_ctx{glsl_context_create()}, m_glsl{}, m_tgsi{}, m_tgsiNumTokens{}, m_info{}, m_code{}, m_codeSize{},
+ 	m_nvsh{}, m_dkph{}
+ {
+ 	m_nvsh.version = 3;
+@@ -277,8 +277,6 @@ DekoCompiler::DekoCompiler(pipeline_stage stage, int optLevel) :
+ 	//m_info.io.bindlessBase = NVC0_CB_AUX_BINDLESS_INFO(0);  // Like suInfoBase, but for bindless textures (pre-Kepler?).
+ 
+ 	m_info.assignSlots = nvc0_program_assign_varying_slots;
+-
+-	glsl_frontend_init();
+ }
+ 
+ DekoCompiler::~DekoCompiler()
+@@ -286,12 +284,19 @@ DekoCompiler::~DekoCompiler()
+ 	if (m_glsl)
+ 		glsl_program_free(m_glsl);
+ 
+-	glsl_frontend_exit();
++	glsl_context_free(m_ctx);
++
++	// Outputs of nv50_ir_generate_code, all malloc'd and owned by the caller (m_code is bin.code).
++	free(m_info.bin.code);
++	free(m_info.bin.relocData);
++	free(m_info.bin.fixupData);
++	free(m_info.bin.syms);
+ }
+ 
+ bool DekoCompiler::CompileGlsl(const char* glsl)
+ {
+-	m_glsl = glsl_program_create(glsl, m_stage);
++	if (!m_ctx) return false;
++	m_glsl = glsl_program_create(m_ctx, glsl, m_stage);
+ 	if (!m_glsl) return false;
+ 
+ 	m_tgsi = glsl_program_get_tokens(m_glsl, m_tgsiNumTokens);
+@@ -659,6 +664,38 @@ void DekoCompiler::OutputDksh(const char* dkshFile)
+ 	}
+ }
+ 
++bool DekoCompiler::OutputDkshToMemory(void** outData, uint32_t* outSize)
++{
++	DkshHeader hdr = {};
++	hdr.magic        = DKSH_MAGIC;
++	hdr.header_sz    = sizeof(DkshHeader);
++	hdr.control_sz   = Align256(sizeof(DkshHeader) + sizeof(DkshProgramHeader));
++	hdr.code_sz      = Align256((m_stage != pipeline_stage_compute ? 0x80 : 0x00) + m_codeSize) + Align256(m_dataSize);
++	hdr.programs_off = sizeof(DkshHeader);
++	hdr.num_programs = 1;
++
++	const uint32_t total = hdr.control_sz + hdr.code_sz;
++	uint8_t* out = (uint8_t*)calloc(1, total);
++	if (!out)
++		return false;
++	uint32_t pos = 0;
++	memcpy(out + pos, &hdr, sizeof(hdr)); pos += sizeof(hdr);
++	memcpy(out + pos, &m_dkph, sizeof(m_dkph));
++	pos = hdr.control_sz;
++	if (m_stage != pipeline_stage_compute)
++	{
++		pos += s_shaderStartOffset;
++		memcpy(out + pos, &m_nvsh, sizeof(m_nvsh)); pos += sizeof(m_nvsh);
++	}
++	memcpy(out + pos, m_code, m_codeSize); pos += m_codeSize;
++	pos = Align256(pos);
++	if (m_dataSize)
++		memcpy(out + pos, m_data, m_dataSize);
++	*outData = out;
++	*outSize = total;
++	return true;
++}
++
+ void DekoCompiler::OutputRawCode(const char* rawFile)
+ {
+ 	FILE* f = fopen(rawFile, "wb");
+diff --git a/source/compiler_iface.h b/source/compiler_iface.h
+index 63e1042..8e1d55c 100644
+--- a/source/compiler_iface.h
++++ b/source/compiler_iface.h
+@@ -18,6 +18,7 @@
+ class DekoCompiler
+ {
+ 	pipeline_stage m_stage;
++	struct gl_context* m_ctx;
+ 	glsl_program m_glsl;
+ 	const struct tgsi_token* m_tgsi;
+ 	unsigned int m_tgsiNumTokens;
+@@ -37,8 +38,15 @@ public:
+ 	DekoCompiler(pipeline_stage stage, int optLevel = 3);
+ 	~DekoCompiler();
+ 
++	// D3D9 0*x=0 rule: MUL/MAD/DP emit FMUL/FFMA .FMZ. Call before CompileGlsl.
++	void SetMulZeroWins(bool on) { m_info.io.mul_zero_wins = on; }
+ 	bool CompileGlsl(const char* glsl);
+ 	void OutputDksh(const char* dkshFile);
++	bool OutputDkshToMemory(void** outData, uint32_t* outSize);
+ 	void OutputRawCode(const char* rawFile);
+ 	void OutputTgsi(const char* tgsiFile);
++
++	// Frees the caches every compiler shares (GLSL types, built-in functions), which otherwise stay
++	// resident between compiles. Only while no DekoCompiler exists on any thread.
++	static void ReleaseCaches() { glsl_frontend_release_caches(); }
+ };
+diff --git a/source/glsl_frontend.cpp b/source/glsl_frontend.cpp
+index 5e940ca..35c5116 100644
+--- a/source/glsl_frontend.cpp
++++ b/source/glsl_frontend.cpp
+@@ -16,6 +16,7 @@
+ #include "glsl/opt_add_neg_to_sub.h"
+ #include "main/mtypes.h"
+ #include "program/program.h"
++#include "program/prog_parameter.h"
+ #include "state_tracker/st_glsl_to_tgsi.h"
+ #include "tgsi/tgsi_from_mesa.h"
+ #include "glsl/ir_uniform.h"
+@@ -327,14 +328,20 @@ initialize_context(struct gl_context *ctx, gl_api api)
+ 	ctx->Driver.NewProgram = new_program;
+ }
+ 
+-static struct gl_context gl_ctx;
++struct gl_context* glsl_context_create()
++{
++	struct gl_context* ctx = (struct gl_context*)calloc(1, sizeof(struct gl_context));
++	if (ctx)
++		initialize_context(ctx, API_OPENGL_CORE);
++	return ctx;
++}
+ 
+-void glsl_frontend_init()
++void glsl_context_free(struct gl_context* ctx)
+ {
+-	initialize_context(&gl_ctx, API_OPENGL_CORE);
++	free(ctx);
+ }
+ 
+-void glsl_frontend_exit()
++void glsl_frontend_release_caches()
+ {
+ 	_mesa_glsl_release_types();
+ 	_mesa_glsl_release_builtin_functions();
+@@ -348,7 +355,7 @@ bool tgsi_translate_geometry(struct gl_context *ctx, struct gl_program *prog);
+ bool tgsi_translate_fragment(struct gl_context *ctx, struct gl_program *prog);
+ bool tgsi_translate_compute(struct gl_context *ctx, struct gl_program *prog);
+ 
+-glsl_program glsl_program_create(const char* source, pipeline_stage stage)
++glsl_program glsl_program_create(struct gl_context* ctx, const char* source, pipeline_stage stage)
+ {
+ 	struct gl_shader_program *prg;
+ 
+@@ -400,7 +407,7 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 	shader->Source = source;
+ 
+ 	// "Compile" the shader
+-	_mesa_glsl_compile_shader(&gl_ctx, shader, false, false, true);
++	_mesa_glsl_compile_shader(ctx, shader, false, false, true);
+ 	if (shader->CompileStatus != COMPILE_SUCCESS)
+ 	{
+ 		fprintf(stderr, "Shader failed to compile.\n");
+@@ -408,10 +415,10 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 			fprintf(stderr, "%s\n", shader->InfoLog);
+ 		goto _fail;
+ 	}
+-	_mesa_clear_shader_program_data(&gl_ctx, prg);
++	_mesa_clear_shader_program_data(ctx, prg);
+ 
+ 	// Link the shader
+-	link_shaders(&gl_ctx, prg);
++	link_shaders(ctx, prg);
+ 	if (prg->data->LinkStatus != LINKING_SUCCESS)
+ 	{
+ 		fprintf(stderr, "Shader failed to link.\n");
+@@ -435,7 +442,7 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 		//_mesa_print_ir(stdout, linked_shader->ir, NULL);
+ 
+ 		// Do the TGSI conversion
+-		if (!st_link_shader(&gl_ctx, prg))
++		if (!st_link_shader(ctx, prg))
+ 		{
+ 			fprintf(stderr, "st_link_shader failed\n");
+ 			goto _fail;
+@@ -457,23 +464,23 @@ glsl_program glsl_program_create(const char* source, pipeline_stage stage)
+ 		switch (stage)
+ 		{
+ 			case pipeline_stage_vertex:
+-				rc = tgsi_translate_vertex(&gl_ctx, linked_shader->Program,
++				rc = tgsi_translate_vertex(ctx, linked_shader->Program,
+ 					gl_program_with_tgsi::from_ptr(linked_shader->Program)->vtx_in_locations);
+ 				break;
+ 			case pipeline_stage_tess_ctrl:
+-				rc = tgsi_translate_tessctrl(&gl_ctx, linked_shader->Program);
++				rc = tgsi_translate_tessctrl(ctx, linked_shader->Program);
+ 				break;
+ 			case pipeline_stage_tess_eval:
+-				rc = tgsi_translate_tesseval(&gl_ctx, linked_shader->Program);
++				rc = tgsi_translate_tesseval(ctx, linked_shader->Program);
+ 				break;
+ 			case pipeline_stage_geometry:
+-				rc = tgsi_translate_geometry(&gl_ctx, linked_shader->Program);
++				rc = tgsi_translate_geometry(ctx, linked_shader->Program);
+ 				break;
+ 			case pipeline_stage_fragment:
+-				rc = tgsi_translate_fragment(&gl_ctx, linked_shader->Program);
++				rc = tgsi_translate_fragment(ctx, linked_shader->Program);
+ 				break;
+ 			case pipeline_stage_compute:
+-				rc = tgsi_translate_compute(&gl_ctx, linked_shader->Program);
++				rc = tgsi_translate_compute(ctx, linked_shader->Program);
+ 				break;
+ 			default:
+ 				fprintf(stderr, "Unsupported stage\n");
+@@ -579,10 +586,17 @@ unsigned glsl_program_compute_get_shared_size(glsl_program prg)
+ void glsl_program_free(glsl_program prg)
+ {
+ 	for (unsigned i = 0; i < MESA_SHADER_STAGES; i++) {
+-		if (prg->_LinkedShaders[i])
++		if (prg->_LinkedShaders[i]) {
++			// The parameter list is malloc'd, outside the program's ralloc tree.
++			if (prg->_LinkedShaders[i]->Program->Parameters)
++				_mesa_free_parameter_list(prg->_LinkedShaders[i]->Program->Parameters);
+ 			ralloc_free(prg->_LinkedShaders[i]->Program);
++			// The linker allocates linked shaders (and their IR) as ralloc roots of their own.
++			ralloc_free(prg->_LinkedShaders[i]);
++		}
+ 	}
+ 
++	delete prg->UniformHash;
+ 	delete prg->AttributeBindings;
+ 	delete prg->FragDataBindings;
+ 	delete prg->FragDataIndexBindings;
+diff --git a/source/glsl_frontend.h b/source/glsl_frontend.h
+index a63e24a..e6127da 100644
+--- a/source/glsl_frontend.h
++++ b/source/glsl_frontend.h
+@@ -16,10 +16,15 @@ enum pipeline_stage
+ 	pipeline_stage_compute,
+ };
+ 
+-void glsl_frontend_init();
+-void glsl_frontend_exit();
++struct gl_context;
+ 
+-glsl_program glsl_program_create(const char* source, pipeline_stage stage);
++// One context per compiler: compiles on separate contexts may run on separate threads at once.
++struct gl_context* glsl_context_create();
++void glsl_context_free(struct gl_context* ctx);
++// Frees the GLSL type and built-in function caches every compile shares. No compile may be running.
++void glsl_frontend_release_caches();
++
++glsl_program glsl_program_create(struct gl_context* ctx, const char* source, pipeline_stage stage);
+ const tgsi_token* glsl_program_get_tokens(glsl_program prg, unsigned int& num_tokens);
+ void* glsl_program_get_constant_buffer(glsl_program prg, unsigned int& out_size);
+ int8_t const* glsl_program_vertex_get_in_locations(glsl_program prg);

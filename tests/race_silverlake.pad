@@ -1,0 +1,19 @@
+# Harness pad script (presented frames at 60 Hz with XBE_PACE=1): title, new profile saved to slot 1,
+# Single Event > Race > USA > Silver Lake Southbound. The frontend comes up near frame 5100.
+5400 START 12
+5700 A 12
+6000 A 12
+6300 UP 12
+6400 A 12
+6700 A 12
+7100 A 12
+7500 DOWN 12
+7600 A 12
+7900 A 12
+8200 RIGHT 12
+8300 DOWN 12
+8400 RIGHT 12
+8600 A 12
+9400 A 12
+# race training film, then the race: accelerator held
+18000 RT 12000

@@ -1,0 +1,22 @@
+# XBE_PAD_SCRIPT for the Switch build, on a fresh hard disk: from the frontend's movie opening, title, new profile
+# saved to slot 1, Single Event > Race > USA > Silver Lake Southbound, the first car, then the race training film (it
+# cannot be skipped the first time) and the race with the accelerator held. `+N buttons hold` is N presented frames
+# after the line before, held for hold frames: short, as a slow emulator draws few frames a second and a long hold
+# auto-repeats in the menus.
+open _FEMain.xmv
++150 START 2
++150 A 2
++150 A 2
++150 UP 2
++100 A 2
++150 A 2
++200 A 2
++200 DOWN 2
++100 A 2
++150 A 2
++150 RIGHT 2
++100 DOWN 2
++100 RIGHT 2
++200 A 2
++800 A 2
++300 RT 1000000

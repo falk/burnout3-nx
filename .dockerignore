@@ -1,0 +1,4 @@
+# the image needs only the shader compiler's build script and patch; never the game files
+*
+!switch/build-uam.sh
+!switch/deko3d/uam-library.patch
